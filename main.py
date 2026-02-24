@@ -461,7 +461,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Start the bot"""
-    TOKEN = "YOUR_BOT_TOKEN_HERE"
+    TOKEN = "8618218088:AAEiTFM9VEUnVHy1dF9PAcIoRzBtq9X8G4s"
     
     # Load player stats
     load_player_stats()
