@@ -5,6 +5,7 @@ import random
 from datetime import datetime
 import json
 import os
+import asyncio
 
 # Enable logging
 logging.basicConfig(
@@ -89,6 +90,8 @@ class MafiaGame:
         self.night_count = 0
         self.voted_out = None
         self.killed_at_night = None
+        self.timer_task = None
+        self.join_time_started = False
         
     def add_player(self, user_id, name):
         if user_id not in self.players:
@@ -148,7 +151,6 @@ games = {}
 player_stats = {}
 
 def load_player_stats():
-    """Load player stats from file"""
     global player_stats
     if os.path.exists('player_stats.json'):
         try:
@@ -161,24 +163,29 @@ def load_player_stats():
         player_stats = {}
 
 def save_player_stats():
-    """Save player stats to file"""
     with open('player_stats.json', 'w') as f:
         data = {str(k): v.to_dict() for k, v in player_stats.items()}
         json.dump(data, f, indent=2)
 
 def get_or_create_stats(user_id, name):
-    """Get or create player stats"""
     if user_id not in player_stats:
         player_stats[user_id] = PlayerStats(user_id, name)
     return player_stats[user_id]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
+    """Start command - Only works in group"""
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text(
+            "❌ This bot only works in groups!\n\n"
+            "Please add me to a group and use /newgame there."
+        )
+        return
+    
     user = update.effective_user
     await update.message.reply_text(
         f"👋 Hello {user.first_name}!\n\n"
         f"🎮 Welcome to the Mafia Game Bot!\n\n"
-        f"Create a new group, add me to it, and use /newgame to start.",
+        f"Use /newgame to start a game in this group.",
         parse_mode='HTML'
     )
 
@@ -206,15 +213,76 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(profile_text, parse_mode='HTML')
 
+async def auto_start_game(context: ContextTypes.DEFAULT_TYPE, group_id, game):
+    """Auto start game after 10 seconds"""
+    await asyncio.sleep(10)
+    
+    if group_id in games and games[group_id].state == GAME_WAITING:
+        game = games[group_id]
+        
+        if len(game.players) < 4:
+            await context.bot.send_message(
+                group_id,
+                f"❌ Not enough players! Only {len(game.players)} joined.\n"
+                f"Game cancelled. Use /newgame to try again."
+            )
+            del games[group_id]
+            return
+        
+        # Start the game
+        if game.start_game():
+            await context.bot.send_message(
+                group_id,
+                "🎮 <b>GAME STARTED!</b>\n\n"
+                "🌙 Night has fallen...\n"
+                "Roles are being assigned...\n\n"
+                "Check your private messages!",
+                parse_mode='HTML'
+            )
+            
+            # Send roles to each player in private
+            for user_id, player in game.players.items():
+                role = player['role']
+                role_description = get_role_description(role)
+                stats = get_or_create_stats(user_id, player['name'])
+                stats.next_role = role
+                stats.total_games += 1
+                
+                try:
+                    await context.bot.send_message(
+                        user_id,
+                        f"🎭 <b>YOUR ROLE: {role}</b>\n\n"
+                        f"{role_description}\n\n"
+                        f"Group में voting के लिए private में vote करो!",
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"Could not send message to {user_id}: {e}")
+            
+            save_player_stats()
+
 async def newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Create a new game in the group"""
+    # Only work in groups
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text(
+            "❌ /newgame only works in groups!\n"
+            "Please add me to a group first."
+        )
+        return
+    
     group_id = update.effective_chat.id
     
-    if group_id in games:
+    if group_id in games and games[group_id].state == GAME_WAITING:
+        await update.message.reply_text("⏳ A game is already waiting for players!")
+        return
+    
+    if group_id in games and games[group_id].state != GAME_ENDED:
         await update.message.reply_text("❌ A game is already running in this group!")
         return
     
     games[group_id] = MafiaGame(group_id)
+    game = games[group_id]
     
     keyboard = [
         [InlineKeyboardButton("✅ Join Game", callback_data='join_game')]
@@ -222,86 +290,57 @@ async def newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "🎮 New Mafia Game Started!\n\n"
-        "Players, click the button below to join.\n"
+        "🎮 <b>New Mafia Game!</b>\n\n"
+        "⏱️ <b>10 seconds to join!</b>\n\n"
+        "Click the button below to join.\n"
         "Minimum 4 players required.\n\n"
-        "Once all players join, use /startgame to begin.",
-        reply_markup=reply_markup
+        "Game will auto-start after 10 seconds!",
+        reply_markup=reply_markup,
+        parse_mode='HTML'
     )
+    
+    # Start auto-start timer
+    game.join_time_started = True
+    context.application.create_task(auto_start_game(context, group_id, game))
 
 async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Join the game"""
     group_id = update.effective_chat.id
     user = update.effective_user
+    query = update.callback_query
     
     if group_id not in games:
-        await update.callback_query.answer("❌ No game found!")
+        await query.answer("❌ No game found!")
         return
     
     game = games[group_id]
     
     if game.state != GAME_WAITING:
-        await update.callback_query.answer("❌ Game has already started!")
+        await query.answer("❌ Game has already started!")
         return
     
     stats = get_or_create_stats(user.id, user.first_name)
     
     if game.add_player(user.id, user.first_name):
         player_count = len(game.players)
-        await update.callback_query.answer(f"✅ Joined the game! ({player_count} players)")
+        await query.answer(f"✅ Joined! ({player_count} players)")
         await context.bot.send_message(
             group_id,
             f"✅ {user.first_name} joined the game!\n"
-            f"Total players: {player_count}"
+            f"<b>Players: {player_count}/∞</b>\n\n"
+            f"⏱️ Game starts in 10 seconds...",
+            parse_mode='HTML'
         )
     else:
-        await update.callback_query.answer("⚠️ You have already joined!")
-
-async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start the game"""
-    group_id = update.effective_chat.id
-    
-    if group_id not in games:
-        await update.message.reply_text("❌ No game found!")
-        return
-    
-    game = games[group_id]
-    
-    if len(game.players) < 4:
-        await update.message.reply_text(
-            f"❌ Minimum 4 players required!\n"
-            f"Current players: {len(game.players)}"
-        )
-        return
-    
-    if game.start_game():
-        await context.bot.send_message(
-            group_id,
-            "🎮 Game Started!\n\n"
-            "🌙 Night has fallen - Mafia will choose their target...\n"
-            "Role messages are being sent to all players."
-        )
-        
-        for user_id, player in game.players.items():
-            role = player['role']
-            role_description = get_role_description(role)
-            stats = get_or_create_stats(user_id, player['name'])
-            stats.next_role = role
-            
-            try:
-                await context.bot.send_message(
-                    user_id,
-                    f"🎭 Your Role: <b>{role}</b>\n\n"
-                    f"{role_description}",
-                    parse_mode='HTML'
-                )
-            except Exception as e:
-                logger.error(f"Could not send message to {user_id}: {e}")
-    else:
-        await update.message.reply_text("❌ Could not start game!")
+        await query.answer("⚠️ You already joined!")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show game status"""
+    # Only work in groups
+    if update.effective_chat.type == 'private':
+        await update.message.reply_text("❌ Use /status in group only!")
+        return
+    
     group_id = update.effective_chat.id
     
     if group_id not in games:
@@ -310,28 +349,17 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     game = games[group_id]
     
-    status_text = f"📊 Game Status\n\n"
-    status_text += f"State: {game.state}\n"
-    status_text += f"Day: {game.day_count}, Night: {game.night_count}\n\n"
-    status_text += f"👥 Players ({len(game.players)}):\n"
+    status_text = f"📊 <b>Game Status</b>\n\n"
+    status_text += f"<b>State:</b> {game.state}\n"
+    status_text += f"<b>Day:</b> {game.day_count}, <b>Night:</b> {game.night_count}\n\n"
+    status_text += f"👥 <b>Players ({len(game.players)}):</b>\n"
     
     for user_id, player in game.players.items():
         status_emoji = "✅" if player['alive'] else "💀"
         role_text = f" - {player['role']}" if game.state == GAME_ENDED else ""
         status_text += f"{status_emoji} {player['name']}{role_text}\n"
     
-    await update.message.reply_text(status_text)
-
-async def buy_diamond(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buy diamond"""
-    user = update.effective_user
-    stats = get_or_create_stats(user.id, user.first_name)
-    
-    await update.message.reply_text(
-        "💎 <b>Buy Diamond</b>\n\n"
-        "Choose amount:",
-        parse_mode='HTML'
-    )
+    await update.message.reply_text(status_text, parse_mode='HTML')
 
 async def store(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Open store"""
@@ -416,27 +444,27 @@ async def handle_store_callback(update: Update, context: ContextTypes.DEFAULT_TY
 def get_role_description(role):
     """Get role description"""
     descriptions = {
-        'Detective': '🕵️ Detective - The city\'s main protector. Find and eliminate Mafia members.',
-        'Sergeant': '👮 Sergeant - Help the Detective. If Detective dies, take their place.',
-        'Mayor': '🎖️ Mayor - You are the Mayor! Your vote equals 2 votes.',
-        'Doctor': '👨‍⚕️ Doctor - Protect the Detective. Can heal yourself once.',
-        'Mafia': '🤵 Mafia - Mafia group member. Decide who to kill at night.',
-        'Don': '🤵 Don - Mafia group leader. Lead your group to victory.',
-        'Lawyer': '👨‍💼 Lawyer - Protect Mafia. Make Detective see false information.',
-        'Killer': '🕴️ Killer - Mafia\'s assassin. Kill anyone you choose.',
-        'Maniac': '🔪 Maniac - Kill everyone around.',
-        'Werewolf': '🐺 Werewolf - Play by your own rules.',
-        'Arsonist': '🧟 Arsonist - Set fires. Kill 3+ players to win.',
-        'Mage': '🧙 Mage - Live by your own laws.',
-        'Crook': '🤹 Crook - Free role. Use others\' names.',
-        'Snitch': '🤓 Snitch - Check same player as Detective.',
-        'Hooker': '💃 Hooker - Block the Killer at night.',
-        'Hobo': '🧙 Hobo - Get a bottle and witness murders.',
-        'Citizen': '👨 Citizen - Regular civilian.',
-        'Lucky': '🤞 Lucky - 50% chance to survive.',
-        'Suicide': '🤦 Suicide - Win if lynched in day.',
-        'Kamikaze': '💣 Kamikaze - Take enemy with you.',
-        'Journalist': '👩‍💻 Journalist - Mafia\'s spy.',
+        'Detective': '🕵️ <b>Detective</b> - Find and vote out Mafia members.',
+        'Sergeant': '👮 <b>Sergeant</b> - Help Detective. Replace if Detective dies.',
+        'Mayor': '🎖️ <b>Mayor</b> - Your vote counts as 2 votes.',
+        'Doctor': '👨‍⚕️ <b>Doctor</b> - Protect players at night. Can protect yourself once.',
+        'Mafia': '🤵 <b>Mafia</b> - Kill players at night with Don.',
+        'Don': '🤵 <b>Don</b> - Mafia leader. Decide who to kill at night.',
+        'Lawyer': '👨‍💼 <b>Lawyer</b> - Protect Mafia. Make Detective see false roles.',
+        'Killer': '🕴️ <b>Killer</b> - Mafia\'s assassin. Kill at night.',
+        'Maniac': '🔪 <b>Maniac</b> - Kill everyone. Win alone.',
+        'Werewolf': '🐺 <b>Werewolf</b> - Conditional roles.',
+        'Arsonist': '🧟 <b>Arsonist</b> - Kill 3+ players to win.',
+        'Mage': '🧙 <b>Mage</b> - Kill or forgive attackers.',
+        'Crook': '🤹 <b>Crook</b> - Use others\' names in voting.',
+        'Snitch': '🤓 <b>Snitch</b> - Match Detective to reveal roles.',
+        'Hooker': '💃 <b>Hooker</b> - Block Killer at night.',
+        'Hobo': '🧙 <b>Hobo</b> - Witness murders at night.',
+        'Citizen': '👨 <b>Citizen</b> - Regular player.',
+        'Lucky': '🤞 <b>Lucky</b> - 50% survive assassination.',
+        'Suicide': '🤦 <b>Suicide</b> - Win if voted out in day.',
+        'Kamikaze': '💣 <b>Kamikaze</b> - Take enemy with you.',
+        'Journalist': '👩‍💻 <b>Journalist</b> - Mafia\'s spy. Find threats.',
     }
     return descriptions.get(role, 'Unknown role')
 
@@ -444,24 +472,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command"""
     help_text = (
         "📖 <b>Mafia Game Bot - Commands</b>\n\n"
-        "/start - Start the bot\n"
-        "/profile - Show your profile and stats\n"
-        "/store - Buy items and upgrades\n"
-        "/newgame - Create new game\n"
-        "/startgame - Start game (4+ players)\n"
-        "/status - Check game status\n"
-        "/help - Show this message\n\n"
+        "<b>Group Commands:</b>\n"
+        "/newgame - Create new game (10 sec to join)\n"
+        "/status - Check game status\n\n"
+        "<b>Private Commands:</b>\n"
+        "/start - Start bot\n"
+        "/profile - View your stats\n"
+        "/store - Buy items\n\n"
         "<b>How to Play:</b>\n"
-        "1. Use /newgame\n"
-        "2. Click 'Join Game'\n"
-        "3. Use /startgame\n"
-        "4. Play according to your role!"
+        "1. /newgame in group\n"
+        "2. Click 'Join Game' (10 seconds)\n"
+        "3. Game auto-starts\n"
+        "4. Receive role in private\n"
+        "5. Vote in private, game in group!"
     )
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 def main():
     """Start the bot"""
-    TOKEN = "8618218088:AAEiTFM9VEUnVHy1dF9PAcIoRzBtq9X8G4s"
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    TOKEN = os.getenv('BOT_TOKEN')
     
     # Load player stats
     load_player_stats()
@@ -473,7 +505,6 @@ def main():
     application.add_handler(CommandHandler("profile", profile))
     application.add_handler(CommandHandler("store", store))
     application.add_handler(CommandHandler("newgame", newgame))
-    application.add_handler(CommandHandler("startgame", startgame))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(join_game, pattern='join_game'))
