@@ -3,6 +3,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import random
 from datetime import datetime
+import json
+import os
 
 # Enable logging
 logging.basicConfig(
@@ -25,11 +27,63 @@ INDIVIDUAL_ROLES = ['Maniac', 'Werewolf', 'Arsonist', 'Mage', 'Crook', 'Snitch']
 
 ALL_ROLES = CIVILIAN_ROLES + MAFIA_ROLES + INDIVIDUAL_ROLES
 
+class PlayerStats:
+    def __init__(self, user_id, name):
+        self.user_id = user_id
+        self.name = name
+        self.dollar = 0
+        self.brilliant = 0
+        self.protection = 0
+        self.killer_protection = 0
+        self.vote_shield = 0
+        self.rifle = 0
+        self.mask = 0
+        self.documents = 0
+        self.winning_score = 0
+        self.total_games = 0
+        self.next_role = None
+        self.wins = 0
+        
+    def to_dict(self):
+        return {
+            'user_id': self.user_id,
+            'name': self.name,
+            'dollar': self.dollar,
+            'brilliant': self.brilliant,
+            'protection': self.protection,
+            'killer_protection': self.killer_protection,
+            'vote_shield': self.vote_shield,
+            'rifle': self.rifle,
+            'mask': self.mask,
+            'documents': self.documents,
+            'winning_score': self.winning_score,
+            'total_games': self.total_games,
+            'next_role': self.next_role,
+            'wins': self.wins,
+        }
+    
+    @staticmethod
+    def from_dict(data):
+        stats = PlayerStats(data['user_id'], data['name'])
+        stats.dollar = data.get('dollar', 0)
+        stats.brilliant = data.get('brilliant', 0)
+        stats.protection = data.get('protection', 0)
+        stats.killer_protection = data.get('killer_protection', 0)
+        stats.vote_shield = data.get('vote_shield', 0)
+        stats.rifle = data.get('rifle', 0)
+        stats.mask = data.get('mask', 0)
+        stats.documents = data.get('documents', 0)
+        stats.winning_score = data.get('winning_score', 0)
+        stats.total_games = data.get('total_games', 0)
+        stats.next_role = data.get('next_role', None)
+        stats.wins = data.get('wins', 0)
+        return stats
+
 class MafiaGame:
     def __init__(self, group_id):
         self.group_id = group_id
         self.state = GAME_WAITING
-        self.players = {}  # {user_id: {'name': str, 'role': str, 'alive': bool}}
+        self.players = {}
         self.mafia_players = []
         self.day_count = 0
         self.night_count = 0
@@ -54,7 +108,6 @@ class MafiaGame:
         return False
     
     def assign_roles(self):
-        """Assign random roles to all players"""
         if len(self.players) < 4:
             return False
         
@@ -90,8 +143,34 @@ class MafiaGame:
         self.state = GAME_ENDED
         return True
 
-# Global games storage
+# Global storage
 games = {}
+player_stats = {}
+
+def load_player_stats():
+    """Load player stats from file"""
+    global player_stats
+    if os.path.exists('player_stats.json'):
+        try:
+            with open('player_stats.json', 'r') as f:
+                data = json.load(f)
+                player_stats = {int(k): PlayerStats.from_dict(v) for k, v in data.items()}
+        except:
+            player_stats = {}
+    else:
+        player_stats = {}
+
+def save_player_stats():
+    """Save player stats to file"""
+    with open('player_stats.json', 'w') as f:
+        data = {str(k): v.to_dict() for k, v in player_stats.items()}
+        json.dump(data, f, indent=2)
+
+def get_or_create_stats(user_id, name):
+    """Get or create player stats"""
+    if user_id not in player_stats:
+        player_stats[user_id] = PlayerStats(user_id, name)
+    return player_stats[user_id]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
@@ -102,6 +181,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Create a new group, add me to it, and use /newgame to start.",
         parse_mode='HTML'
     )
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show player profile and stats"""
+    user = update.effective_user
+    stats = get_or_create_stats(user.id, user.first_name)
+    
+    profile_text = (
+        f"👤 <b>Profile: {stats.name}</b>\n\n"
+        f"⭐ ID: {stats.user_id}\n\n"
+        f"💰 Dollar: {stats.dollar}\n"
+        f"💎 Brilliant: {stats.brilliant}\n\n"
+        f"🛡️ Protection: {stats.protection}\n"
+        f"🔴 Killer protection: {stats.killer_protection}\n"
+        f"⚖️ Vote shield: {stats.vote_shield}\n"
+        f"🔫 Rifle: {stats.rifle}\n\n"
+        f"🎭 Mask: {stats.mask}\n"
+        f"📄 Documents: {stats.documents}\n\n"
+        f"🎯 Your role in next game: {stats.next_role or '-'}\n\n"
+        f"🏆 Winning score: {stats.winning_score}\n"
+        f"🎲 Total games: {stats.total_games}\n"
+        f"✅ Wins: {stats.wins}"
+    )
+    
+    await update.message.reply_text(profile_text, parse_mode='HTML')
 
 async def newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Create a new game in the group"""
@@ -141,6 +244,8 @@ async def join_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("❌ Game has already started!")
         return
     
+    stats = get_or_create_stats(user.id, user.first_name)
+    
     if game.add_player(user.id, user.first_name):
         player_count = len(game.players)
         await update.callback_query.answer(f"✅ Joined the game! ({player_count} players)")
@@ -177,10 +282,12 @@ async def startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Role messages are being sent to all players."
         )
         
-        # Send roles to each player
         for user_id, player in game.players.items():
             role = player['role']
             role_description = get_role_description(role)
+            stats = get_or_create_stats(user_id, player['name'])
+            stats.next_role = role
+            
             try:
                 await context.bot.send_message(
                     user_id,
@@ -215,30 +322,121 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(status_text)
 
+async def buy_diamond(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buy diamond"""
+    user = update.effective_user
+    stats = get_or_create_stats(user.id, user.first_name)
+    
+    await update.message.reply_text(
+        "💎 <b>Buy Diamond</b>\n\n"
+        "Choose amount:",
+        parse_mode='HTML'
+    )
+
+async def store(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Open store"""
+    user = update.effective_user
+    
+    keyboard = [
+        [InlineKeyboardButton("💰 Buy Dollar", callback_data='buy_dollar'),
+         InlineKeyboardButton("💎 Buy Diamond", callback_data='buy_diamond')],
+        [InlineKeyboardButton("🛡️ Protection", callback_data='item_protection')],
+        [InlineKeyboardButton("🔴 Killer Protection", callback_data='item_killer_protection')],
+        [InlineKeyboardButton("⚖️ Vote Shield", callback_data='item_vote_shield')],
+        [InlineKeyboardButton("🔫 Rifle", callback_data='item_rifle')],
+        [InlineKeyboardButton("🎭 Mask", callback_data='item_mask')],
+        [InlineKeyboardButton("📄 Documents", callback_data='item_documents')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "🏪 <b>Store</b>\n\n"
+        "Choose what to buy:",
+        reply_markup=reply_markup,
+        parse_mode='HTML'
+    )
+
+async def handle_store_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle store callbacks"""
+    user = update.effective_user
+    stats = get_or_create_stats(user.id, user.first_name)
+    query = update.callback_query
+    
+    if query.data == 'buy_dollar':
+        stats.dollar += 30
+        await query.answer("✅ Bought $30!")
+    elif query.data == 'buy_diamond':
+        stats.brilliant += 5
+        await query.answer("✅ Bought 5 Diamonds!")
+    elif query.data == 'item_protection':
+        if stats.dollar >= 50:
+            stats.dollar -= 50
+            stats.protection += 1
+            await query.answer("✅ Bought Protection!")
+        else:
+            await query.answer("❌ Not enough dollars!")
+    elif query.data == 'item_killer_protection':
+        if stats.dollar >= 75:
+            stats.dollar -= 75
+            stats.killer_protection += 1
+            await query.answer("✅ Bought Killer Protection!")
+        else:
+            await query.answer("❌ Not enough dollars!")
+    elif query.data == 'item_vote_shield':
+        if stats.dollar >= 60:
+            stats.dollar -= 60
+            stats.vote_shield += 1
+            await query.answer("✅ Bought Vote Shield!")
+        else:
+            await query.answer("❌ Not enough dollars!")
+    elif query.data == 'item_rifle':
+        if stats.dollar >= 100:
+            stats.dollar -= 100
+            stats.rifle += 1
+            await query.answer("✅ Bought Rifle!")
+        else:
+            await query.answer("❌ Not enough dollars!")
+    elif query.data == 'item_mask':
+        if stats.dollar >= 40:
+            stats.dollar -= 40
+            stats.mask += 1
+            await query.answer("✅ Bought Mask!")
+        else:
+            await query.answer("❌ Not enough dollars!")
+    elif query.data == 'item_documents':
+        if stats.dollar >= 80:
+            stats.dollar -= 80
+            stats.documents += 1
+            await query.answer("✅ Bought Documents!")
+        else:
+            await query.answer("❌ Not enough dollars!")
+    
+    save_player_stats()
+
 def get_role_description(role):
     """Get role description"""
     descriptions = {
-        'Detective': '🕵️ Detective - The city\'s main protector. Find and eliminate Mafia members during voting.',
+        'Detective': '🕵️ Detective - The city\'s main protector. Find and eliminate Mafia members.',
         'Sergeant': '👮 Sergeant - Help the Detective. If Detective dies, take their place.',
-        'Mayor': '🎖️ Mayor - You are the Mayor! Your vote equals 2 votes during day voting.',
-        'Doctor': '👨‍⚕️ Doctor - Protect the Detective when they declare themselves. Can heal yourself once.',
-        'Mafia': '🤵 Mafia - Mafia group member. Decide who to eliminate at night.',
+        'Mayor': '🎖️ Mayor - You are the Mayor! Your vote equals 2 votes.',
+        'Doctor': '👨‍⚕️ Doctor - Protect the Detective. Can heal yourself once.',
+        'Mafia': '🤵 Mafia - Mafia group member. Decide who to kill at night.',
         'Don': '🤵 Don - Mafia group leader. Lead your group to victory.',
-        'Lawyer': '👨‍💼 Lawyer - Protect the Mafia. Make Detective see false information.',
-        'Killer': '🕴️ Killer - Mafia\'s assassin. Kill anyone you choose each night.',
-        'Maniac': '🔪 Maniac - Kill everyone around. Win by eliminating all others.',
-        'Werewolf': '🐺 Werewolf - Play by your own rules. Become Mafia if killed by Don, Sergeant if killed by Detective.',
+        'Lawyer': '👨‍💼 Lawyer - Protect Mafia. Make Detective see false information.',
+        'Killer': '🕴️ Killer - Mafia\'s assassin. Kill anyone you choose.',
+        'Maniac': '🔪 Maniac - Kill everyone around.',
+        'Werewolf': '🐺 Werewolf - Play by your own rules.',
         'Arsonist': '🧟 Arsonist - Set fires. Kill 3+ players to win.',
-        'Mage': '🧙 Mage - Live by your own laws. Kill or forgive those who try to kill you.',
-        'Crook': '🤹 Crook - Free role. Use others\' names in day voting. Survive to win.',
-        'Snitch': '🤓 Snitch - Check the same player as Detective on same night. Reveal their role to win.',
-        'Hooker': '💃 Hooker - Block the Killer at night. Don\'t visit the Detective intentionally.',
+        'Mage': '🧙 Mage - Live by your own laws.',
+        'Crook': '🤹 Crook - Free role. Use others\' names.',
+        'Snitch': '🤓 Snitch - Check same player as Detective.',
+        'Hooker': '💃 Hooker - Block the Killer at night.',
         'Hobo': '🧙 Hobo - Get a bottle and witness murders.',
-        'Citizen': '👨 Citizen - Regular civilian. Find and lynch Mafia members.',
-        'Lucky': '🤞 Lucky - 50% chance to survive assassination. Win with civilians.',
-        'Suicide': '🤦 Suicide - Win if lynched during day. Lose if killed at night.',
-        'Kamikaze': '💣 Kamikaze - Take Maniac or Mafia with you. Choose your companion when leaving.',
-        'Journalist': '👩‍💻 Journalist - Mafia\'s spy. Find threats to Mafia like Doctor, Hobo, Hooker.',
+        'Citizen': '👨 Citizen - Regular civilian.',
+        'Lucky': '🤞 Lucky - 50% chance to survive.',
+        'Suicide': '🤦 Suicide - Win if lynched in day.',
+        'Kamikaze': '💣 Kamikaze - Take enemy with you.',
+        'Journalist': '👩‍💻 Journalist - Mafia\'s spy.',
     }
     return descriptions.get(role, 'Unknown role')
 
@@ -247,32 +445,39 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📖 <b>Mafia Game Bot - Commands</b>\n\n"
         "/start - Start the bot\n"
+        "/profile - Show your profile and stats\n"
+        "/store - Buy items and upgrades\n"
         "/newgame - Create new game\n"
-        "/startgame - Start game (4+ players required)\n"
+        "/startgame - Start game (4+ players)\n"
         "/status - Check game status\n"
         "/help - Show this message\n\n"
         "<b>How to Play:</b>\n"
         "1. Use /newgame\n"
-        "2. Let players join with 'Join Game' button\n"
-        "3. Use /startgame when ready\n"
+        "2. Click 'Join Game'\n"
+        "3. Use /startgame\n"
         "4. Play according to your role!"
     )
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 def main():
     """Start the bot"""
-    # Replace with your actual token
     TOKEN = "YOUR_BOT_TOKEN_HERE"
+    
+    # Load player stats
+    load_player_stats()
     
     application = Application.builder().token(TOKEN).build()
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("profile", profile))
+    application.add_handler(CommandHandler("store", store))
     application.add_handler(CommandHandler("newgame", newgame))
     application.add_handler(CommandHandler("startgame", startgame))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(join_game, pattern='join_game'))
+    application.add_handler(CallbackQueryHandler(handle_store_callback, pattern='^(buy_|item_)'))
     
     # Run the bot
     application.run_polling()
